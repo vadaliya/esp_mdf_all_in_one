@@ -15,8 +15,9 @@
 #include "mdf_common.h"
 #include "mwifi.h"
 #include "driver/uart.h"
+#include "mesh_mqtt_handle.h"
 
-// #define MEMORY_DEBUG
+#define MEMORY_DEBUG
 
 #define BUF_SIZE (1024)
 
@@ -24,10 +25,14 @@ static int g_sockfd = -1;
 static const char *TAG = "router_example";
 static esp_netif_t *netif_sta = NULL;
 
+// It's Store status of Device Type(Root/Node)
+int Device_Type = 0;
+
 /**
  * @brief Create a tcp client
  */
-static int socket_tcp_client_create(const char *ip, uint16_t port)
+static int
+socket_tcp_client_create(const char *ip, uint16_t port)
 {
     MDF_PARAM_CHECK(ip);
 
@@ -196,42 +201,87 @@ void tcp_client_write_task(void *arg)
     vTaskDelete(NULL);
 }
 
-
-static void root_task(void *arg)
+// Root Device Write Task....
+void root_write_task(void *arg)
 {
-    mdf_err_t ret                    = MDF_OK;
-    char *data                       = MDF_MALLOC(MWIFI_PAYLOAD_LEN);
-    size_t size                      = MWIFI_PAYLOAD_LEN;
+    mdf_err_t ret = MDF_OK;
+    char *data = NULL;
+    size_t size = MWIFI_PAYLOAD_LEN;
     uint8_t src_addr[MWIFI_ADDR_LEN] = {0x0};
-    mwifi_data_type_t data_type      = {0};
+    mwifi_data_type_t data_type = {0x0};
 
-    MDF_LOGI("Root is running");
+    MDF_LOGI("Root write task is running");
 
-    for (int i = 0;; ++i) {
-        if (!mwifi_is_started()) {
+    while (esp_mesh_is_root())
+    {
+        if (!mwifi_get_root_status())
+        {
             vTaskDelay(1000 / portTICK_RATE_MS);
             continue;
         }
 
-        size = MWIFI_PAYLOAD_LEN;
-        memset(data, 0, MWIFI_PAYLOAD_LEN);
-        ret = mwifi_root_read(src_addr, &data_type, data, &size, portMAX_DELAY);
-        MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_root_read", mdf_err_to_name(ret));
-        MDF_LOGI("Root receive, addr: " MACSTR ", size: %d, data: %s", MAC2STR(src_addr), size, data);
+        /**
+         * @brief Recv data from node, and forward to mqtt server.
+         */
+        ret = mwifi_root_read(src_addr, &data_type, &data, &size, portMAX_DELAY);
+        MDF_ERROR_GOTO(ret != MDF_OK, MEM_FREE, "<%s> mwifi_root_read", mdf_err_to_name(ret));
 
-        size = sprintf(data, "(%d) Hello node!", i);
-        ret = mwifi_root_write(src_addr, 1, &data_type, data, size, true);
-        MDF_ERROR_CONTINUE(ret != MDF_OK, "mwifi_root_recv, ret: %x", ret);
-        MDF_LOGI("Root send, addr: " MACSTR ", size: %d, data: %s", MAC2STR(src_addr), size, data);
+        ret = mesh_mqtt_write(src_addr, data, size, MESH_MQTT_DATA_JSON);
+
+        MDF_ERROR_GOTO(ret != MDF_OK, MEM_FREE, "<%s> mesh_mqtt_publish", mdf_err_to_name(ret));
+
+    MEM_FREE:
+        MDF_FREE(data);
     }
 
-    MDF_LOGW("Root is exit");
-
-    MDF_FREE(data);
+    MDF_LOGW("Root write task is exit");
+    mesh_mqtt_stop();
     vTaskDelete(NULL);
 }
 
+// Root Device read task...
+void root_read_task(void *arg)
+{
+    mdf_err_t ret = MDF_OK;
 
+    MDF_LOGI("Root read task is running");
+
+    while (esp_mesh_is_root())
+    {
+        if (!mwifi_get_root_status())
+        {
+            vTaskDelay(1000 / portTICK_RATE_MS);
+            continue;
+        }
+
+        mesh_mqtt_data_t *request = NULL;
+        mwifi_data_type_t data_type = {0x0};
+
+        /**
+         * @brief Recv data from mqtt data queue, and forward to special device.
+         */
+        ret = mesh_mqtt_read(&request, pdMS_TO_TICKS(500));
+
+        if (ret != MDF_OK)
+        {
+            continue;
+        }
+
+        ret = mwifi_root_write(request->addrs_list, request->addrs_num, &data_type, request->data, request->size, true);
+        MDF_ERROR_GOTO(ret != MDF_OK, MEM_FREE, "<%s> mwifi_root_write", mdf_err_to_name(ret));
+
+    MEM_FREE:
+        MDF_FREE(request->addrs_list);
+        MDF_FREE(request->data);
+        MDF_FREE(request);
+    }
+
+    MDF_LOGW("Root read task is exit");
+    mesh_mqtt_stop();
+    vTaskDelete(NULL);
+}
+
+//Node Device Read Task...
 static void node_read_task(void *arg)
 {
     mdf_err_t ret = MDF_OK;
@@ -263,15 +313,16 @@ static void node_read_task(void *arg)
     vTaskDelete(NULL);
 }
 
-
+//Node Device Write Task...
 static void node_write_task(void *arg)
 {
     size_t size = 0;
-    int count = 0;
+    //int count = 0;
     char *data = NULL;
     mdf_err_t ret = MDF_OK;
     mwifi_data_type_t data_type = {0};
     uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
+    mesh_addr_t parent_mac = {0};
 
     MDF_LOGI("NODE task is running");
 
@@ -284,13 +335,13 @@ static void node_write_task(void *arg)
             vTaskDelay(1000 / portTICK_RATE_MS);
             continue;
         }
+        esp_mesh_get_parent_bssid(&parent_mac);
 
-        size = asprintf(&data, "{\"src_addr\": \"" MACSTR "\",\"data\": \"Hello TCP Server!\",\"count\": %d}",
-                        MAC2STR(sta_mac), count++);
-
+        size = asprintf(&data, "{\"type\":\"heartbeat\", \"self\": \"%02x%02x%02x%02x%02x%02x\", \"parent\":\"%02x%02x%02x%02x%02x%02x\",\"layer\":%d}",
+                        MAC2STR(sta_mac), MAC2STR(parent_mac.addr), esp_mesh_get_layer());
         MDF_LOGD("Node send, size: %d, data: %s", size, data);
         ret = mwifi_write(NULL, &data_type, data, size, true);
-        MDF_FREE(data); 
+        MDF_FREE(data);
         MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_write", mdf_err_to_name(ret));
 
         vTaskDelay(3000 / portTICK_RATE_MS);
@@ -301,7 +352,6 @@ static void node_write_task(void *arg)
 
     vTaskDelete(NULL);
 }
-
 
 /**
  * @brief Timed printing system information
@@ -399,22 +449,75 @@ static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx)
 
     case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
         MDF_LOGI("Parent is disconnected on station interface");
+
+        if (esp_mesh_is_root())
+        {
+            mesh_mqtt_stop();
+        }
+
         break;
 
     case MDF_EVENT_MWIFI_ROUTING_TABLE_ADD:
     case MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE:
-        MDF_LOGI("total_num: %d", esp_mesh_get_total_node_num());
+        MDF_LOGI("MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE, total_num: %d", esp_mesh_get_total_node_num());
+
+        if (esp_mesh_is_root() && mwifi_get_root_status())
+        {
+            mdf_err_t err = mesh_mqtt_update_topo();
+
+            if (err != MDF_OK)
+            {
+                MDF_LOGE("Update topo failed");
+            }
+        }
         break;
 
     case MDF_EVENT_MWIFI_ROOT_GOT_IP:
     {
         MDF_LOGI("Root obtains the IP address. It is posted by LwIP stack automatically");
-        xTaskCreate(tcp_client_write_task, "tcp_client_write_task", 4 * 1024,
-                    NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-        xTaskCreate(tcp_client_read_task, "tcp_server_read", 4 * 1024,
-                    NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-        break;
+
+        mesh_mqtt_start(CONFIG_MQTT_URL);
+
+        if (Device_Type == 1)
+        {
+            xTaskCreate(root_write_task, "root_write", 4 * 1024,
+                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+            xTaskCreate(root_read_task, "root_read", 4 * 1024,
+                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+        }
+
+        else if (Device_Type == 2)
+        {
+            xTaskCreate(node_write_task, "node_write_task", 4 * 1024,
+                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
+            xTaskCreate(node_read_task, "node_read_task", 4 * 1024,
+                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
+            break; 
+        }
     }
+
+    case MDF_EVENT_CUSTOM_MQTT_CONNECTED:
+        MDF_LOGI("MQTT connect");
+        mdf_err_t err = mesh_mqtt_subscribe();
+        if (err != MDF_OK)
+        {
+            MDF_LOGE("Subscribe failed");
+        }
+        err = mesh_mqtt_update_topo();
+        if (err != MDF_OK)
+        {
+            MDF_LOGE("Update topo failed");
+        }
+
+        mwifi_post_root_status(true);
+        break;
+
+    case MDF_EVENT_CUSTOM_MQTT_DISCONNECTED:
+        MDF_LOGI("MQTT disconnected");
+        mwifi_post_root_status(false);
+        break;
 
     default:
         break;
@@ -431,14 +534,19 @@ void app_main()
         .router_password = CONFIG_ROUTER_PASSWORD,
         .mesh_id = CONFIG_MESH_ID,
         .mesh_password = CONFIG_MESH_PASSWORD,
-        .mesh_type = CONFIG_DEVICE_TYPE,
+        .mesh_type = CONFIG_DEVICE_TYPE, // 1 = Root, 2 = Node
     };
+
+//Assign config.mesh_type value in Device_Type variable.
+    int Device_Type = (int)config.mesh_type;
+
 
     /**
      * @brief Set the log level for serial port printing.
      */
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
+    esp_log_level_set("mesh_mqtt", ESP_LOG_DEBUG);
 
     /**
      * @brief Initialize wifi mesh.
@@ -462,20 +570,25 @@ void app_main()
     /**
      * @breif Create handler
      */
-    if (config.mesh_type == 1)
-    {
-        xTaskCreate(root_task, "root_task", 4 * 1024,
-                    NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-    }
-    else if (config.mesh_type == 2)
+    if (Device_Type == 1)
     {
         xTaskCreate(node_write_task, "node_write_task", 4 * 1024,
                     NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
+        xTaskCreate(node_read_task, "node_read_task", 4 * 1024,
+                    NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+    }
+    else if (Device_Type == 2)
+    {
+        xTaskCreate(node_write_task, "node_write_task", 4 * 1024,
+                    NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
         xTaskCreate(node_read_task, "node_read_task", 4 * 1024,
                     NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
     }
 
     TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_RATE_MS,
                                        true, NULL, print_system_info_timercb);
+
     xTimerStart(timer, 0);
 }

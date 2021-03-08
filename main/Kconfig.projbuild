@@ -42,6 +42,12 @@ config MESH_PASSWORD
     help
         Mesh AP password. Password length must be 8 bits smaller than 64 bits,Set to null to not encrypt
 
+config MQTT_URL
+    string "MQTT broker URL"
+    default "mqtt://iot.eclipse.org"
+    help
+        URL of the broker to connect to        
+
 config SERVER_IP
     string "Server IP address"
         default "192.168.0.1"
